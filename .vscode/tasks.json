@@ -1,0 +1,7 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {"label": "检查开发环境", "type": "process", "command": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/scripts/check-environment.ps1"], "problemMatcher": []},
+    {"label": "编译 SDK 验证程序（不刷写）", "type": "process", "command": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/scripts/build-smoke.ps1"], "problemMatcher": ["$gcc"], "group": {"kind": "build", "isDefault": true}}
+  ]
+}
