@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "编译 Pro Micro 红板心率固件（不刷写）",
+      "label": "Build Pro Micro firmware",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -10,58 +10,15 @@
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "${workspaceFolder}/scripts/build-promicro.ps1"
+        "${workspaceFolder}/scripts/build.ps1"
       ],
       "problemMatcher": [
         "$gcc"
       ],
       "group": {
-        "isDefault": true,
-        "kind": "build"
+        "kind": "build",
+        "isDefault": true
       }
-    },
-    {
-      "label": "编译 ANT 心率示例（不刷写）",
-      "type": "process",
-      "command": "powershell.exe",
-      "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        "${workspaceFolder}/scripts/build-ant-smoke.ps1"
-      ],
-      "problemMatcher": [
-        "$gcc"
-      ]
-    },
-    {
-      "label": "检查开发环境",
-      "type": "process",
-      "command": "powershell.exe",
-      "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        "${workspaceFolder}/scripts/check-environment.ps1"
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "编译 SDK 验证程序（不刷写）",
-      "type": "process",
-      "command": "powershell.exe",
-      "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        "${workspaceFolder}/scripts/build-smoke.ps1"
-      ],
-      "problemMatcher": [
-        "$gcc"
-      ]
     }
   ]
 }

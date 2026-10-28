@@ -5,3 +5,6 @@ build*/
 secrets/
 sdk/
 artifacts/
+__pycache__/
+*.pyc
+*.sync-conflict-*

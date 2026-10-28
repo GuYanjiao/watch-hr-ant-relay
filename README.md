@@ -1,105 +1,150 @@
 # Watch HR ANT Relay
 
-目标：nRF52840 接收手表的 BLE 心率数据，按 ANT+ 心率设备规范发送。
+把手表的蓝牙心率转发为 ANT+ 心率，让支持 ANT+ 的码表接收实时心率。
 
-开发板：Pro Micro 外形 nRF52840 红板。编辑器：VS Code。
+```text
+手表心率共享 ── BLE / GATT ──► nRF52840 ── ANT+ ──► 码表
+```
+
+已在 **Pro Micro nRF52840 红板**上完成实机联调：开发板持续接收手表心率，码表成功搜索到设备并显示实时心率。ANT+ 设备号为 **4242**。
+
+## 功能
+
+- 自动扫描标准心率服务 `0x180D`，连接第一个匹配设备并订阅心率特征 `0x2A37`。
+- 解析 8/16 位心率、接触状态、能量字段和 RR 间隔；心率值按 ANT 的 8 位范围转发。
+- 以约 4 Hz 发送 ANT+ HRM 数据及背景页。
+- 断线后重新扫描；5 秒无新心率、接触丢失或零心率时停止 ANT 广播；15 秒没有合法通知时重新连接。
+- 通过 USB 串口查看运行状态、进入 UF2 刷写模式。
+
+这里的“心率共享”需要提供**可连接的标准 BLE 心率服务**，不是解析厂商私有广告包。首次使用时只开启目标设备的心率共享，并断开手机等设备对该服务的占用。
+
+没有 RR 间隔时，固件根据 BPM 推算心跳次数和时间，**不能作为真实 HRV 数据使用**。本次实测手表提供 BPM，没有 RR 间隔。
+
+## 硬件
+
+当前适配和验证的是 Pro Micro 外形的 nRF52840 红板，启动程序信息为：
+
+| 项目 | 已验证配置 |
+| --- | --- |
+| 板型标识 | `nRF52840-nicenano` |
+| 启动程序 | UF2 0.6.0 |
+| 原厂 SoftDevice | S140 6.1.1 |
+| 启动磁盘卷标 | `NICENANO` |
+| 应用起始地址 | `0x26000` |
+| 应用区域终点 | `0xEC000` |
+
+固件使用高频晶振合成低频时钟（SYNTH），并显式启动高频晶振。这是本次红板实测所需的时钟处理，功耗尚未优化。其他启动程序版本或克隆板需要核对分区及硬件配置。
+
+## 目录
+
+```text
+firmware/
+  src/main.c                 BLE 连接、ANT 转发及 USB 控制
+  src/hr_measurement.[ch]     BLE 心率数据解析
+  boards/                    红板配置、静态分区表
+scripts/
+  build.ps1                  构建红板 UF2
+  flash.ps1                  检查固件与目标磁盘并刷写
+  bootloader.py              让运行中的固件进入 UF2 模式
+  monitor.py                 读取 USB 日志
+  verify_uf2.py               检查 UF2 数据块及启动入口
+tests/                      ARM 心率解析测试
+.vscode/                     VS Code 扩展和默认构建任务
+requirements-dev.txt         Python 工具及测试依赖
+```
 
 ## 开发环境
 
-- 源码在当前目录，Git 本地仓库，沿用用户现有提交身份。
-- Nordic 工具安装在 C:\ncs，避免把 SDK 和编译器放入 Git。
-- 版本基线：nRF Connect SDK v3.2.4，ANT Add-on v2.1.1。
-- ANT 与 SDK 版本依照官方兼容表固定：https://ant-nrfconnect.github.io/doc/compatibility.html
-- 官方 ANT 安装指南：https://ant-nrfconnect.github.io/doc/getting_started.html
+当前构建脚本面向 **Windows / PowerShell**，编辑器使用 VS Code。
 
-环境已配置，Pro Micro 红板版本已完成实机 BLE→ANT+ 联调。板载 bootloader、引脚与低频时钟在硬件适配阶段核对。ANT 官方要求低频时钟误差不超过 ±50 ppm。
+| 依赖 | 版本 / 路径 |
+| --- | --- |
+| nRF Connect SDK | `v3.2.4`，`C:\ncs\v3.2.4` |
+| ANT Add-on | `v2.1.1`，`C:\ncs\addons\sdk-ant-v2.1.1` |
+| Nordic 工具链 | `fd21892d0f`，`C:\ncs\toolchains\fd21892d0f` |
+| nrfutil | `C:\ncs\bin\nrfutil.exe`，安装 SDK Manager |
+| Python | 3.10 或以上 |
+| VS Code 扩展 | nRF Connect Extension Pack、C/C++ |
 
-BLE 接收端先按标准 Heart Rate Service（0x180D）/Heart Rate Measurement（0x2A37）实现。最终接收方式依据设备实际输出确认；心率广播的产品名称不一定代表心率值直接位于广告包内。
+先按 [Nordic SDK 安装说明](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/installation.html)安装工具。仓库使用固定 SDK/工具链版本；如果改动安装位置，需要相应修改构建、刷写和测试脚本。
 
-## 已验证的环境
-
-2026-10-28：Git 2.56.0、nrfutil 8.2.1、SDK Manager 1.16.1、Device 2.23.0；SDK v3.2.4 与工具链 fd21892d0f 已安装。ARM GCC 12.2.0、Python 3.12.4、west 1.4.0。VS Code 已安装 Nordic 扩展包与 C/C++ 扩展。
-
-ANT 源码：C:\ncs\addons\sdk-ant-v2.1.1，标签 v2.1.1，提交 08cecef477745fe2c34a5ef58d7b1dafa1f3a444。
-
-以下两个参考板构建均完整编译、链接并生成 merged.hex：
-
-- scripts/build-smoke.ps1：hello_world，产物 C:\ncs\build\watch-hr-smoke\merged.hex。
-- scripts/build-ant-smoke.ps1：ANT+ hrm_tx，产物 C:\ncs\build\watch-hr-ant-smoke\merged.hex，启用个人评估配置。
-
-两者板型都是 nrf52840dk/nrf52840，仅验证环境，不代表 Pro Micro 红板的引脚、bootloader 或无线功能已验证。未刷写任何设备。
-
-VS Code 菜单“终端 → 运行任务”可执行环境检查与编译。打开 watch-hr-ant-relay.code-workspace 即进入工作区。Git 使用原有用户身份，未配置远程仓库，也未推送。初始化提交因已有 GPG 签名等待无响应而使用单次不签名提交，全局签名配置保持不变。
-
-## 第一版转换固件
-
-源码：`firmware/`。在 VS Code 中按 Ctrl+Shift+B，或运行：
+SDK 和 ANT Add-on 的安装命令：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-relay.ps1
+nrfutil install sdk-manager
+nrfutil sdk-manager install v3.2.4 --install-dir C:\ncs --region cn
+git clone --branch v2.1.1 --depth 1 https://github.com/ant-nrfconnect/sdk-ant.git C:\ncs\addons\sdk-ant-v2.1.1
 ```
 
-脚本将源码同步到专用目录 `C:\ncs\apps\watch-hr-ant-relay` 再编译，以避开中文路径问题。构建产物在 `C:\ncs\build\watch-hr-relay\merged.hex`。
+ANT Add-on 与 SDK 的版本对应关系见[官方兼容表](https://ant-nrfconnect.github.io/doc/compatibility.html)。
 
-当前实现：
-
-- 主动扫描标准 BLE 心率服务 0x180D，连接第一个匹配设备，订阅 0x2A37。
-- 解析 8/16 位心率、传感器接触状态、能量字段与 RR 间隔；超过 ANT 8 位范围的 BPM 不转发。
-- 使用 ANT HRM profile 以 4 Hz 发送心率及背景页，开发设备号为 4242。
-- 收到有效心率才开启 ANT；断线、零心率、接触丢失或 5 秒无新心率时停止广播。
-- BLE 断开自动重扫，15 秒没有合法通知时主动重连；订阅被拒绝也重连。
-- 有 RR 间隔时累计真实逐搏数据；没有 RR 时根据 BPM 推算心跳次数/时间，不能作为真实 HRV 数据使用。
-
-本版支持“可连接的标准 BLE 心率服务”。不解析厂家私有的广告包心率，也不提供设备选择界面。首次联调时只开启目标手表的心率共享功能。
-
-### 验证与当前边界
-
-参考板配置 `nrf52840dk/nrf52840` 已完整编译、链接，BLE 和 ANT 同时启用。未在 Pro Micro 红板上刷写或验证无线链路。当前 `merged.hex` 是参考板构建，不应直接刷入红板；仍需确认它的 bootloader、分区与低频晶振后生成匹配版本。
-
-解析测试直接模拟运行交叉编译后的 ARM C 代码：
+在仓库根目录安装 Python 依赖：
 
 ```powershell
-C:\Python315\python.exe -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r tests\requirements.txt
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+## 构建
+
+在 VS Code 打开仓库文件夹，按 `Ctrl+Shift+B`，或执行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+```
+
+脚本会把应用源码复制到 `C:\ncs\apps\watch-hr-ant-relay` 后构建，以避开中文路径对工具链的影响。UF2 产物：
+
+```text
+C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2
+```
+
+静态分区表同时约束链接地址和写入地址；构建结束后自动验证 UF2 芯片系列、每个数据块的范围、初始栈及复位入口。
+
+## 刷写与使用
+
+1. 用 USB 数据线连接开发板。首次刷写时，在半秒内将 **RST 与 GND 短接两次，每次立即松开**，使 `NICENANO` 磁盘出现。RAW 是供电引脚，不用于复位。
+2. 运行刷写命令：
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\flash.ps1
+   ```
+
+3. 开启手表的心率共享，将手表放在开发板附近。
+4. 在码表中添加 ANT+ 心率传感器，选择设备号 **4242**。
+
+刷写工具只接受匹配板型的 `NICENANO` 磁盘，并检查应用 UF2 地址；保留原厂启动程序和 SoftDevice 区域，不执行整片擦除。
+
+已运行本项目固件时，可以通过电脑进入 UF2 模式：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\bootloader.py
+```
+
+然后再次执行 `scripts\flash.ps1`。USB 仅用于供电、日志和刷写；正常转发无需手机中转。
+
+## 日志与测试
+
+读取运行日志：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\monitor.py --seconds 30
+```
+
+工具自动识别固件 USB 串口，将日志保存为 `artifacts/relay-serial.log`。正常转发时可看到 `BLE=connected`、`fresh_HR=1`、`ANT=1` 和实时 BPM。
+
+解析测试：
+
+```powershell
 .\.venv\Scripts\python.exe tests\test_parser.py
 ```
 
-已通过：8/16 位心率、RR 与能量字段、接触状态、零心率、范围限制、截断及格式错误数据包。该测试不代替实机 BLE/ANT 射频联调。
+测试交叉编译实际的 C 解析器，并通过 Unicorn 执行 ARM 指令，覆盖 8/16 位心率、能量字段、RR 间隔、接触状态、数值范围及截断/格式错误输入。
 
-ANT 依赖使用 SDK 自带的个人评估配置；依赖许可保留在 `C:\ncs\addons\sdk-ant-v2.1.1\LICENSE.txt`，profile 的 Shared Source License 见该 SDK 对应源码文件头。
+已验证编译、UF2 刷写、USB 进入启动模式、实际 BLE 心率接收和码表 ANT+ 接收。断线恢复、长时间稳定性及电池功耗尚未单独完成实机测试。
 
-## Pro Micro 红板版本
+## 依赖与许可
 
-运行 `scripts/build-promicro.ps1`，产物为：
+仓库不包含 Nordic SDK、ANT 协议栈、网络密钥、原厂固件备份或实机日志。ANT 使用 SDK 的个人非商业评估配置，其他用途应按 [ANT 官方许可](https://developer.garmin.com/ant-program/)取得相应授权。
 
-`C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2`
-
-使用 Zephyr 的 `promicro_nrf52840/nrf52840/uf2` 板型，应用地址 0x26000。USB 日志产品名为 Watch HR ANT Relay。初次联调使用高频时钟合成低频时钟，避免依赖部分克隆板未安装的 32.768 kHz 晶振，代价是较高功耗。无线时序与功耗仍需实机验证。
-
-刷写前可运行：
-
-```powershell
-C:\Python315\python.exe scripts\verify-uf2.py C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2
-```
-
-脚本检查 UF2 格式、芯片系列和每个数据块的地址，仅允许写入应用区域。刷写应复制 `zephyr.uf2` 到已确认的板载启动磁盘，不使用参考板 merged.hex，也不擦除启动程序。
-
-已连接时识别到 USB VID 239A、运行态 PID 8029（COM4）；1200 波特触发后曾出现 PID 00B3（COM5），当时未出现磁盘。已确认启动程序 UF2 0.6.0、nice!nano、S140 6.1.1。原始 CURRENT.UF2 和 INFO_UF2.TXT 已备份在 artifacts/board-backup（Git 忽略）。
-
-
-实机联调进展：修正 NCS Partition Manager 与 DTS 不一致导致的入口错位，静态分区表为 config/promicro-pm-static.yml。UF2 检查同时验证每个写入块、初始栈地址和复位入口，防止只迁移文件地址却没有迁移链接地址。修正版已写入，USB 串口 COM6 正常枚举；日志确认 ANT/SDC 初始化成功、BLE 扫描命令启动。最初扫描报告数为 0；修正合成低频时钟模式下外部高频晶振未启动的问题后，扫描及心率订阅恢复。
-
-读取日志：`.venv\Scripts\python.exe scripts\monitor-serial.py --seconds 30`，输出保存到 artifacts/relay-serial.log。依赖见 scripts/requirements.txt。日志每五秒输出扫描报告数、心率新鲜状态和 ANT 开关。
-
-Pro Micro 版本支持在 USB 串口发送大写 `B` 请求进入 UF2 启动模式（依据 Adafruit GPREGRET 0x57 约定），用于后续联调，保留双复位进入方式。
-
-
-## 实机验证结果（2026-10-28）
-
-已在本次连接的红色 Pro Micro nRF52840（启动程序标识 nice!nano）上刷写并运行。开发板自动连接已开启共享的手表，持续收到约 95–100 bpm 的标准心率通知；日志确认 BLE=connected、fresh_HR=1、ANT=1，ANT HRM 页中的心率随手表数据更新。用户已确认码表可以接收并显示心率，BLE→nRF52840→ANT+→码表链路完成验证。ANT 设备号 4242。
-
-当前手表通知没有 RR 间隔，因此本版输出的心跳时间/次数根据 BPM 推算，不能用于真实 HRV 分析。断线重连及超时停播已实现，但尚未单独完成实机断连恢复测试；长时间稳定性和电池功耗也未测量。
-
-板上保留本次验证通过的固件。原始备份在 artifacts/board-backup，工作日志在 artifacts/working-heart-rate.log，以上文件不提交 Git。低频时钟使用 SYNTH；代码保持高频晶振的受管请求，并显式启动晶振，以解决本次 MPSL/时钟配置下受管请求没有触发硬件启动的问题。运行日志确认 HFCLK 从 0x10000 变为 0x10001 后链路恢复。
-
-后续更新可先运行 `.venv\Scripts\python.exe scripts/enter-bootloader.py`（已实测进入 NICENANO），再运行 `scripts/flash-promicro.ps1`。刷写脚本会核对目标磁盘、板型标识和 UF2 启动地址；VS Code 默认构建已切换到红板版本。
+第三方源码归属及许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

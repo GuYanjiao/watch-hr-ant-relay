@@ -301,8 +301,8 @@ int main(void)
     int clock_err = onoff_request(z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF),
                                   &hf_client);
     if (clock_err < 0) startup_error("HFXO request", clock_err);
-    /* Bring-up diagnostic: the managed request has not started HFXO on this
-       bootloader/clock configuration. Hold the request and trigger startup. */
+    /* This MPSL/SYNTH configuration needs an explicit HFXO start. Keep the
+       managed request held so the crystal remains available for LFSYNTH. */
     NRF_CLOCK->TASKS_HFCLKSTART = 1;
     int64_t deadline = k_uptime_get() + 1000;
     while ((NRF_CLOCK->HFCLKSTAT & 1) == 0) {
@@ -339,11 +339,6 @@ int main(void)
             LOG_INF("Status: BLE=%s, scan_reports=%ld, fresh_HR=%u, ANT=%u",
                     atomic_get(&ble_connected) ? "connected" : "scanning",
                     (long)atomic_get(&scan_reports), fresh, ant_open);
-            LOG_INF("Radio diagnostics: HFCLK=0x%lx LFCLK=0x%lx RADIO=%lu RTC0=%lu",
-                    (unsigned long)NRF_CLOCK->HFCLKSTAT,
-                    (unsigned long)NRF_CLOCK->LFCLKSTAT,
-                    (unsigned long)NRF_RADIO->STATE,
-                    (unsigned long)NRF_RTC0->COUNTER);
             next_status = k_uptime_get() + 5000;
         }
         if (fresh && !ant_open && !ant_closing) {
