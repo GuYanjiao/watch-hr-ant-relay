@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "编译心率转换固件（不刷写）",
+      "label": "编译 Pro Micro 红板心率固件（不刷写）",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -10,7 +10,7 @@
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "${workspaceFolder}/scripts/build-relay.ps1"
+        "${workspaceFolder}/scripts/build-promicro.ps1"
       ],
       "problemMatcher": [
         "$gcc"

@@ -11,6 +11,11 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/sys/reboot.h>
+#include <nrfx.h>
 #include <ant_interface.h>
 #include <ant_parameters.h>
 #include <ant_key_manager.h>
@@ -34,7 +39,26 @@ static struct {
 static ant_hrm_profile_t hrm;
 K_MSGQ_DEFINE(ant_events, sizeof(ant_evt_t), 32, 4);
 static atomic_t ant_overflow;
+static atomic_t scan_reports;
+static atomic_t ble_connected;
 static bool ant_open, ant_closing;
+static void usb_bootloader_check(void)
+{
+#if defined(CONFIG_BOARD_PROMICRO_NRF52840)
+    const struct device *console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    static bool rx_enabled;
+    if (!rx_enabled && device_is_ready(console)) {
+        uart_irq_rx_enable(console);
+        rx_enabled = true;
+    }
+    unsigned char command;
+    if (uart_poll_in(console, &command) == 0 && command == 'B') {
+        /* Adafruit bootloader's documented UF2 reset request. */
+        NRF_POWER->GPREGRET = 0x57;
+        sys_reboot(SYS_REBOOT_COLD);
+    }
+#endif
+}
 static void profile_event(ant_hrm_profile_t *profile, ant_hrm_evt_t event);
 HRM_SENS_PROFILE_CONFIG_DEF(relay, true, ANT_HRM_PAGE_0, profile_event);
 /* Evaluation identity: device number 4242; manufacturer 255 = development. */
@@ -188,6 +212,7 @@ static void scan_result(const bt_addr_le_t *address, int8_t rssi, uint8_t type,
                         struct net_buf_simple *ad)
 {
     ARG_UNUSED(rssi);
+    atomic_inc(&scan_reports);
     if (peer || (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_SCAN_RSP)) return;
     bool found = false;
     bt_data_parse(ad, advertised, &found);
@@ -221,6 +246,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
         return;
     }
     LOG_INF("BLE connected; discovering heart rate service");
+    atomic_set(&ble_connected, 1);
     k_work_reschedule(&receive_watchdog, K_SECONDS(15));
     memset(&subscription, 0, sizeof(subscription));
     memset(&discovery, 0, sizeof(discovery));
@@ -237,6 +263,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
     ARG_UNUSED(conn);
     LOG_INF("BLE disconnected: %u", reason);
+    atomic_clear(&ble_connected);
     k_work_cancel_delayable(&receive_watchdog);
     invalidate();
     if (peer) bt_conn_unref(peer);
@@ -250,6 +277,15 @@ static void ant_callback(ant_evt_t *event)
 {
     if (k_msgq_put(&ant_events, event, K_NO_WAIT)) atomic_set(&ant_overflow, 1);
 }
+static void startup_error(const char *stage, int err)
+{
+    /* Keep the failure visible even if USB is opened after startup. */
+    while (true) {
+        usb_bootloader_check();
+        LOG_ERR("%s initialization failed: %d", stage, err);
+        k_sleep(K_SECONDS(5));
+    }
+}
 int main(void)
 {
     int err = ant_init();
@@ -257,16 +293,34 @@ int main(void)
     if (!err) err = ant_plus_key_set(0);
     if (!err) err = ant_hrm_sens_init(&hrm, HRM_SENS_CHANNEL_CONFIG(relay),
                                      HRM_SENS_PROFILE_CONFIG(relay));
-    if (err) { LOG_ERR("ANT initialization failed: %d", err); return err; }
+    if (err) startup_error("ANT", err);
+#if defined(CONFIG_CLOCK_CONTROL_NRF_K32SRC_SYNTH)
+    /* LFSYNTH must run from the crystal, not from the HF RC oscillator. */
+    static struct onoff_client hf_client;
+    sys_notify_init_spinwait(&hf_client.notify);
+    int clock_err = onoff_request(z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF),
+                                  &hf_client);
+    if (clock_err < 0) startup_error("HFXO request", clock_err);
+    /* Bring-up diagnostic: the managed request has not started HFXO on this
+       bootloader/clock configuration. Hold the request and trigger startup. */
+    NRF_CLOCK->TASKS_HFCLKSTART = 1;
+    int64_t deadline = k_uptime_get() + 1000;
+    while ((NRF_CLOCK->HFCLKSTAT & 1) == 0) {
+        if (k_uptime_get() >= deadline) startup_error("HFXO startup timeout", -ETIMEDOUT);
+        k_sleep(K_MSEC(1));
+    }
+#endif
     hrm.HRM_PROFILE_manuf_id = 255;
     hrm.HRM_PROFILE_serial_num = 4242;
     hrm.HRM_PROFILE_hw_version = 1;
     hrm.HRM_PROFILE_sw_version = 1;
     hrm.HRM_PROFILE_model_num = 1;
     err = bt_enable(NULL);
-    if (err) { LOG_ERR("BLE initialization failed: %d", err); return err; }
+    if (err) startup_error("BLE", err);
     k_work_reschedule(&scan_work, K_NO_WAIT);
+    int64_t next_status = 0;
     while (true) {
+        usb_bootloader_check();
         ant_evt_t event;
         if (!k_msgq_get(&ant_events, &event, K_MSEC(50))) {
             if (event.event == EVENT_CHANNEL_CLOSED) {
@@ -281,6 +335,17 @@ int main(void)
         k_spinlock_key_t key = k_spin_lock(&sample_lock);
         bool fresh = sample.valid && k_uptime_get() - sample.received < STALE_MS;
         k_spin_unlock(&sample_lock, key);
+        if (k_uptime_get() >= next_status) {
+            LOG_INF("Status: BLE=%s, scan_reports=%ld, fresh_HR=%u, ANT=%u",
+                    atomic_get(&ble_connected) ? "connected" : "scanning",
+                    (long)atomic_get(&scan_reports), fresh, ant_open);
+            LOG_INF("Radio diagnostics: HFCLK=0x%lx LFCLK=0x%lx RADIO=%lu RTC0=%lu",
+                    (unsigned long)NRF_CLOCK->HFCLKSTAT,
+                    (unsigned long)NRF_CLOCK->LFCLKSTAT,
+                    (unsigned long)NRF_RADIO->STATE,
+                    (unsigned long)NRF_RTC0->COUNTER);
+            next_status = k_uptime_get() + 5000;
+        }
         if (fresh && !ant_open && !ant_closing) {
             profile_event(&hrm, ANT_HRM_PAGE_0_UPDATED);
             err = ant_hrm_sens_open(&hrm);

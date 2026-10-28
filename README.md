@@ -12,7 +12,7 @@
 - ANT 与 SDK 版本依照官方兼容表固定：https://ant-nrfconnect.github.io/doc/compatibility.html
 - 官方 ANT 安装指南：https://ant-nrfconnect.github.io/doc/getting_started.html
 
-环境已配置，第一版转发固件已完成参考板构建。板载 bootloader、引脚与低频时钟在硬件适配阶段核对。ANT 官方要求低频时钟误差不超过 ±50 ppm。
+环境已配置，Pro Micro 红板版本已完成实机 BLE→ANT+ 联调。板载 bootloader、引脚与低频时钟在硬件适配阶段核对。ANT 官方要求低频时钟误差不超过 ±50 ppm。
 
 BLE 接收端先按标准 Heart Rate Service（0x180D）/Heart Rate Measurement（0x2A37）实现。最终接收方式依据设备实际输出确认；心率广播的产品名称不一定代表心率值直接位于广告包内。
 
@@ -67,3 +67,39 @@ C:\Python315\python.exe -m venv .venv
 已通过：8/16 位心率、RR 与能量字段、接触状态、零心率、范围限制、截断及格式错误数据包。该测试不代替实机 BLE/ANT 射频联调。
 
 ANT 依赖使用 SDK 自带的个人评估配置；依赖许可保留在 `C:\ncs\addons\sdk-ant-v2.1.1\LICENSE.txt`，profile 的 Shared Source License 见该 SDK 对应源码文件头。
+
+## Pro Micro 红板版本
+
+运行 `scripts/build-promicro.ps1`，产物为：
+
+`C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2`
+
+使用 Zephyr 的 `promicro_nrf52840/nrf52840/uf2` 板型，应用地址 0x26000。USB 日志产品名为 Watch HR ANT Relay。初次联调使用高频时钟合成低频时钟，避免依赖部分克隆板未安装的 32.768 kHz 晶振，代价是较高功耗。无线时序与功耗仍需实机验证。
+
+刷写前可运行：
+
+```powershell
+C:\Python315\python.exe scripts\verify-uf2.py C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2
+```
+
+脚本检查 UF2 格式、芯片系列和每个数据块的地址，仅允许写入应用区域。刷写应复制 `zephyr.uf2` 到已确认的板载启动磁盘，不使用参考板 merged.hex，也不擦除启动程序。
+
+已连接时识别到 USB VID 239A、运行态 PID 8029（COM4）；1200 波特触发后曾出现 PID 00B3（COM5），当时未出现磁盘。已确认启动程序 UF2 0.6.0、nice!nano、S140 6.1.1。原始 CURRENT.UF2 和 INFO_UF2.TXT 已备份在 artifacts/board-backup（Git 忽略）。
+
+
+实机联调进展：修正 NCS Partition Manager 与 DTS 不一致导致的入口错位，静态分区表为 config/promicro-pm-static.yml。UF2 检查同时验证每个写入块、初始栈地址和复位入口，防止只迁移文件地址却没有迁移链接地址。修正版已写入，USB 串口 COM6 正常枚举；日志确认 ANT/SDC 初始化成功、BLE 扫描命令启动。最初扫描报告数为 0；修正合成低频时钟模式下外部高频晶振未启动的问题后，扫描及心率订阅恢复。
+
+读取日志：`.venv\Scripts\python.exe scripts\monitor-serial.py --seconds 30`，输出保存到 artifacts/relay-serial.log。依赖见 scripts/requirements.txt。日志每五秒输出扫描报告数、心率新鲜状态和 ANT 开关。
+
+Pro Micro 版本支持在 USB 串口发送大写 `B` 请求进入 UF2 启动模式（依据 Adafruit GPREGRET 0x57 约定），用于后续联调，保留双复位进入方式。
+
+
+## 实机验证结果（2026-10-28）
+
+已在本次连接的红色 Pro Micro nRF52840（启动程序标识 nice!nano）上刷写并运行。开发板自动连接已开启共享的手表，持续收到约 95–100 bpm 的标准心率通知；日志确认 BLE=connected、fresh_HR=1、ANT=1，ANT HRM 页中的心率随手表数据更新。用户已确认码表可以接收并显示心率，BLE→nRF52840→ANT+→码表链路完成验证。ANT 设备号 4242。
+
+当前手表通知没有 RR 间隔，因此本版输出的心跳时间/次数根据 BPM 推算，不能用于真实 HRV 分析。断线重连及超时停播已实现，但尚未单独完成实机断连恢复测试；长时间稳定性和电池功耗也未测量。
+
+板上保留本次验证通过的固件。原始备份在 artifacts/board-backup，工作日志在 artifacts/working-heart-rate.log，以上文件不提交 Git。低频时钟使用 SYNTH；代码保持高频晶振的受管请求，并显式启动晶振，以解决本次 MPSL/时钟配置下受管请求没有触发硬件启动的问题。运行日志确认 HFCLK 从 0x10000 变为 0x10001 后链路恢复。
+
+后续更新可先运行 `.venv\Scripts\python.exe scripts/enter-bootloader.py`（已实测进入 NICENANO），再运行 `scripts/flash-promicro.ps1`。刷写脚本会核对目标磁盘、板型标识和 UF2 启动地址；VS Code 默认构建已切换到红板版本。
