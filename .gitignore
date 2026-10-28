@@ -1,0 +1,7 @@
+build*/
+.venv/
+*.log
+.env
+secrets/
+sdk/
+artifacts/
