@@ -13,7 +13,8 @@ subprocess.run([str(bin_dir / 'arm-zephyr-eabi-gcc.exe'), '-O2', '-mcpu=cortex-m
                 '-mthumb', '-ffreestanding', '-fno-builtin', '-nostdlib',
                 '-Wl,-Ttext=0x10000', '-Wl,-e,run_tests', '-I' + str(root / 'firmware/src'),
                 str(root / 'firmware/src/hr_measurement.c'),
-                str(root / 'tests/hr_measurement_test.c'), '-o', str(elf)], check=True)
+                str(root / 'tests/hr_measurement_test.c'),
+                str(root / 'firmware/src/activity.c'), str(root / 'tests/activity_test.c'), '-o', str(elf)], check=True)
 subprocess.run([str(bin_dir / 'arm-zephyr-eabi-objcopy.exe'), '-O', 'binary',
                 str(elf), str(build / 'parser.bin')], check=True)
 symbols = subprocess.check_output([str(bin_dir / 'arm-zephyr-eabi-nm.exe'), str(elf)], text=True)
@@ -27,7 +28,10 @@ emu.reg_write(UC_ARM_REG_LR, 0x1f001)
 emu.emu_start(entry | 1, 0x1f000, count=100000)
 result = emu.reg_read(UC_ARM_REG_R0)
 if result:
-    raise AssertionError(f'C parser test failed at hr_measurement_test.c:{result}')
+    source, line = ('activity_test.c', result - 1000) if result >= 1000 else ('hr_measurement_test.c', result)
+    raise AssertionError(f'C firmware test failed at {source}:{line}')
 from unicorn.arm_const import UC_ARM_REG_PC
 assert emu.reg_read(UC_ARM_REG_PC) == 0x1f000, 'Test did not return before instruction limit'
 print('PASS: ARM C parser: 8/16-bit BPM, energy, RR, contact, zero, limits, truncated/malformed packets')
+
+print('PASS: ARM C activity policy: search deadline, cooldown, HR loss, coasting, inactivity; cadence layouts and rollover')

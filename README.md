@@ -10,10 +10,10 @@
 
 ## 功能
 
-- 自动扫描标准心率服务 `0x180D`，连接第一个匹配设备并订阅心率特征 `0x2A37`。
+- 检测 ANT+ 踏频计的真实圈数变化后，才扫描标准心率服务 `0x180D`、连接并订阅 `0x2A37`。
 - 解析 8/16 位心率、接触状态、能量字段和 RR 间隔；心率值按 ANT 的 8 位范围转发。
 - 以约 4 Hz 发送 ANT+ HRM 数据及背景页。
-- 断线后重新扫描；5 秒无新心率、接触丢失或零心率时停止 ANT 广播；15 秒没有合法通知时重新连接。
+- 5 秒无新心率、接触丢失或零心率时停止 ANT 心率广播；15 秒没有合法通知时重新连接，30 秒没有恢复有效心率则返回待机。
 - 通过 USB 串口查看运行状态、进入 UF2 刷写模式。
 
 这里的“心率共享”需要提供**可连接的标准 BLE 心率服务**，不是解析厂商私有广告包。首次使用时只开启目标设备的心率共享，并断开手机等设备对该服务的占用。
@@ -41,6 +41,7 @@
 firmware/
   src/main.c                 BLE 连接、ANT 转发及 USB 控制
   src/hr_measurement.[ch]     BLE 心率数据解析
+  src/activity.[ch]           踏频变化判断与自动启停策略
   boards/                    红板配置、静态分区表
 scripts/
   build.ps1                  构建红板 UF2
@@ -48,7 +49,7 @@ scripts/
   bootloader.py              让运行中的固件进入 UF2 模式
   monitor.py                 读取 USB 日志
   verify_uf2.py               检查 UF2 数据块及启动入口
-tests/                      ARM 心率解析测试
+tests/                      ARM 心率解析、踏频及状态逻辑测试
 .vscode/                     VS Code 扩展和默认构建任务
 requirements-dev.txt         Python 工具及测试依赖
 ```
@@ -110,7 +111,7 @@ C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\flash.ps1
    ```
 
-3. 开启手表的心率共享，将手表放在开发板附近。
+3. 开启手表的心率共享，将手表和 ANT+ 踏频计放在开发板附近，持续转动曲柄，等待触发。未绑定时两种传感器类型交替搜索，同类搜索窗口间隔最长约 40 秒；绑定后约 20 秒。
 4. 在码表中添加 ANT+ 心率传感器，选择设备号 **4242**。
 
 刷写工具只接受匹配板型的 `NICENANO` 磁盘，并检查应用 UF2 地址；保留原厂启动程序和 SoftDevice 区域，不执行整片擦除。
@@ -123,6 +124,24 @@ C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2
 
 然后再次执行 `scripts\flash.ps1`。USB 仅用于供电、日志和刷写；正常转发无需手机中转。
 
+## 踏频触发与自动待机
+
+| 条件 | 默认行为 |
+| --- | --- |
+| 上电 / 待机 | BLE 不扫描、不发心率；每 20 秒开启一个约 5 秒的 ANT 低优先级搜索窗口 |
+| 尚未确定传感器类型 | 交替搜索踏频专用设备（类型 122）及速度/踏频组合设备（类型 121） |
+| 连续报文显示曲柄圈数与事件时间有效递增 | 开始搜索心率；重复广播、纯轮速变化不会触发 |
+| 心率搜索 | 最长 45 秒，以收到有效心率通知为成功条件 |
+| 搜索失败 / 心率丢失 / 长时间停车 | 返回待机，冷却 60 秒；冷却期间不进行 ANT 搜索，之后须有新圈数变化才能重试 |
+| 已转发但无有效心率 | 5 秒停发旧心率；保留重连机会，30 秒未恢复则待机 |
+| 滑行 / 红灯 / 停车 | 允许 180 秒没有新踩踏；超过后即使还有心率也返回待机 |
+
+首次有效踩踏会绑定最先识别到的传感器，绑定只保持到本次断电/重启。附近有多个踏频计时，可在 `firmware/prj.conf` 中设置 `CONFIG_CADENCE_DEVICE_NUMBER=设备号`；设备号见日志 `Cadence sensor learned`。时间参数集中在 `firmware/src/activity.h`。
+
+策略参考 [Bike2FTMS](https://github.com/magpern/Bike2FTMS) 的信号驱动桥接思路及 [ANT 官方功耗说明](https://developer.garmin.com/ant-program/faq/?category=power-consumption) 的定时接收建议。上表数值是本项目为手表连接、滑行及等待红灯选取的初始参数，不是相关项目已经验证过的统一标准。没有加入新的运动传感器或物理开关。
+
+这里的待机是功能待机，不是 System OFF：仍需接收 ANT 信号。现有 SYNTH 时钟方案保持高频晶振运行，USB 和板载器件也有耗电；本版本不承诺微安级待机或纽扣电池级续航。回退固件本地保存在 `artifacts/rollback/before-cadence.uf2`（不上传 Git）。
+
 ## 日志与测试
 
 读取运行日志：
@@ -131,7 +150,7 @@ C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2
 .\.venv\Scripts\python.exe scripts\monitor.py --seconds 30
 ```
 
-工具自动识别固件 USB 串口，将日志保存为 `artifacts/relay-serial.log`。正常转发时可看到 `BLE=connected`、`fresh_HR=1`、`ANT=1` 和实时 BPM。
+工具自动识别固件 USB 串口，将日志保存为 `artifacts/relay-serial.log`。日志中 `mode=standby` 表示等待踩踏，`mode=searching` 表示正在找心率，`mode=forwarding` 表示转发中。正常转发可看到 `BLE=connected`、`fresh_HR=1`、`ANT=1` 和实时 BPM。
 
 解析测试：
 
@@ -139,9 +158,9 @@ C:\ncs\build\watch-hr-promicro\watch-hr-ant-relay\zephyr\zephyr.uf2
 .\.venv\Scripts\python.exe tests\test_parser.py
 ```
 
-测试交叉编译实际的 C 解析器，并通过 Unicorn 执行 ARM 指令，覆盖 8/16 位心率、能量字段、RR 间隔、接触状态、数值范围及截断/格式错误输入。
+测试交叉编译实际 C 代码并通过 Unicorn 执行 ARM 指令，覆盖心率解析、踏频/组合传感器报文、圈数及时间回绕、重复包、异常踏频、搜索期限、重试冷却、心率丢失及短暂停踩/长时间停车。
 
-已验证编译、UF2 刷写、USB 进入启动模式、实际 BLE 心率接收和码表 ANT+ 接收。断线恢复、长时间稳定性及电池功耗尚未单独完成实机测试。
+基础版本已验证实际 BLE 心率接收和码表 ANT+ 接收。自动启停版本已通过编译、UF2 校验及 ARM 状态逻辑测试，初版已刷写并确认实机待机及间歇搜索正常。真实踏频触发、触发后的心率转发和超时返回仍待踏频计到场测试；长时间稳定性和电池功耗未测量。
 
 ## 依赖与许可
 

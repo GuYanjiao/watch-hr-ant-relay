@@ -19,12 +19,16 @@
 #include <ant_interface.h>
 #include <ant_parameters.h>
 #include <ant_key_manager.h>
+#include <ant_channel_config.h>
 #include <ant_profiles/hrm/ant_hrm.h>
 #include "hr_measurement.h"
+#include "activity.h"
 
 LOG_MODULE_REGISTER(relay, LOG_LEVEL_INF);
 #define STALE_MS 5000
 static struct bt_conn *peer;
+static atomic_t ble_allowed;
+static struct activity activity;
 static struct bt_uuid_16 uuid = BT_UUID_INIT_16(0);
 static struct bt_gatt_discover_params discovery;
 static struct bt_gatt_subscribe_params subscription;
@@ -117,6 +121,7 @@ static void profile_event(ant_hrm_profile_t *profile, ant_hrm_evt_t event)
 static uint8_t notified(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
                         const void *data, uint16_t length)
 {
+    if (!atomic_get(&ble_allowed)) return BT_GATT_ITER_STOP;
     if (!data) {
         params->value_handle = 0;
         invalidate();
@@ -156,6 +161,7 @@ static uint8_t discovered(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                           struct bt_gatt_discover_params *params)
 {
     int err;
+    if (!atomic_get(&ble_allowed)) return BT_GATT_ITER_STOP;
     if (!attr) {
         LOG_WRN("Required heart rate attribute missing");
         bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
@@ -213,10 +219,11 @@ static void scan_result(const bt_addr_le_t *address, int8_t rssi, uint8_t type,
 {
     ARG_UNUSED(rssi);
     atomic_inc(&scan_reports);
-    if (peer || (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_SCAN_RSP)) return;
+    if (!atomic_get(&ble_allowed) || peer || (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_SCAN_RSP)) return;
     bool found = false;
     bt_data_parse(ad, advertised, &found);
-    if (!found || bt_le_scan_stop()) return;
+    if (!found || !atomic_get(&ble_allowed) || bt_le_scan_stop()) return;
+    if (!atomic_get(&ble_allowed)) return;
     int err = bt_conn_le_create(address, BT_CONN_LE_CREATE_CONN,
                                 BT_LE_CONN_PARAM_DEFAULT, &peer);
     if (err) {
@@ -227,7 +234,7 @@ static void scan_result(const bt_addr_le_t *address, int8_t rssi, uint8_t type,
 static void scan_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
-    if (peer) return;
+    if (!atomic_get(&ble_allowed) || peer) return;
     const struct bt_le_scan_param params = {
         .type = BT_LE_SCAN_TYPE_ACTIVE,
         .interval = BT_GAP_SCAN_FAST_INTERVAL,
@@ -243,6 +250,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
         if (peer) bt_conn_unref(peer);
         peer = NULL;
         k_work_reschedule(&scan_work, K_SECONDS(1));
+        return;
+    }
+    if (!atomic_get(&ble_allowed)) {
+        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         return;
     }
     LOG_INF("BLE connected; discovering heart rate service");
@@ -273,6 +284,113 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 BT_CONN_CB_DEFINE(connection_callbacks) = {
     .connected = connected, .disconnected = disconnected,
 };
+static const char *activity_name(enum activity_state state)
+{
+    return state == ACTIVITY_STANDBY ? "standby" :
+           state == ACTIVITY_SEARCHING ? "searching" : "forwarding";
+}
+static void ble_stop(void)
+{
+    atomic_clear(&ble_allowed);
+    struct k_work_sync sync;
+    k_work_cancel_delayable_sync(&scan_work, &sync);
+    k_work_cancel_delayable(&receive_watchdog);
+    (void)bt_le_scan_stop();
+    bt_conn_foreach(BT_CONN_TYPE_LE, timeout_disconnect, NULL);
+    invalidate();
+}
+struct cadence_receiver {
+    uint8_t channel, type;
+    uint16_t period;
+    bool open, closing;
+    struct cadence_tracker tracker;
+};
+static struct cadence_receiver cadence_rx[] = {
+    {.channel = 1, .type = 122, .period = 8102},
+    {.channel = 2, .type = 121, .period = 8086},
+};
+static uint16_t cadence_id = CONFIG_CADENCE_DEVICE_NUMBER;
+static uint8_t cadence_type;
+static unsigned next_receiver;
+static int64_t next_listen, listen_deadline;
+static int cadence_setup(void)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(cadence_rx); ++i) {
+        struct cadence_receiver *rx = &cadence_rx[i];
+        const ant_channel_config_t cfg = {
+            .channel_number = rx->channel, .channel_type = CHANNEL_TYPE_SLAVE,
+            .device_type = rx->type, .device_number = cadence_id,
+            .channel_period = rx->period, .rf_freq = 57, .network_number = 0,
+        };
+        int err = ant_channel_init(&cfg);
+        /* High-priority search must not interrupt heart-rate transmission. */
+        if (!err) err = ant_channel_rx_search_timeout_set(rx->channel, 0);
+        if (!err) err = ant_channel_low_priority_rx_search_timeout_set(rx->channel, 2);
+        if (err) return err;
+    }
+    return 0;
+}
+static bool cadence_event(ant_evt_t *event)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(cadence_rx); ++i) {
+        struct cadence_receiver *rx = &cadence_rx[i];
+        if (event->channel != rx->channel) continue;
+        if (event->event == EVENT_CHANNEL_CLOSED) {
+            rx->open = rx->closing = false;
+            rx->tracker.initialized = false;
+        } else if (event->event == EVENT_RX_FAIL_GO_TO_SEARCH) {
+            rx->tracker.initialized = false;
+        } else if (event->event == EVENT_RX && !rx->closing &&
+                   event->message.ANT_MESSAGE_ucSize >= 9 &&
+                   (event->message.ANT_MESSAGE_ucMesgID == MESG_BROADCAST_DATA_ID ||
+                    event->message.ANT_MESSAGE_ucMesgID == MESG_ACKNOWLEDGED_DATA_ID)) {
+            uint16_t id;
+            uint8_t type, transmission;
+            int err = ant_channel_id_get(rx->channel, &id, &type, &transmission);
+            if (err || type != rx->type || (cadence_id && id != cadence_id) ||
+                (cadence_type && type != cadence_type)) return false;
+            bool moving = cadence_motion(&rx->tracker, type,
+                event->message.ANT_MESSAGE_aucPayload, 8, k_uptime_get());
+            if (moving && !cadence_type) {
+                cadence_id = id;
+                cadence_type = type;
+                LOG_INF("Cadence sensor learned: id=%u type=%u (until reboot)", id, type);
+            }
+            return moving;
+        }
+        break;
+    }
+    return false;
+}
+static void cadence_poll(int64_t now, bool active)
+{
+    bool cooldown = !active && now < activity.retry_after;
+    bool busy = false;
+    for (unsigned i = 0; i < ARRAY_SIZE(cadence_rx); ++i) {
+        struct cadence_receiver *rx = &cadence_rx[i];
+        if (!active && (now >= listen_deadline || cooldown) && rx->open && !rx->closing) {
+            int err = ant_channel_close(rx->channel);
+            if (!err) rx->closing = true;
+            else LOG_WRN("Cadence close failed: %d", err);
+        }
+        busy |= rx->open || rx->closing;
+    }
+    if (busy || cooldown || now < next_listen) return;
+    struct cadence_receiver *rx = &cadence_rx[next_receiver];
+    if (cadence_type) {
+        rx = &cadence_rx[cadence_type == 122 ? 0 : 1];
+    } else next_receiver = (next_receiver + 1) % ARRAY_SIZE(cadence_rx);
+    int err = ant_channel_id_set(rx->channel, cadence_id, rx->type, 0);
+    if (!err) err = ant_channel_open(rx->channel);
+    next_listen = now + CADENCE_POLL_MS;
+    if (err) LOG_WRN("Cadence search start failed: %d", err);
+    else {
+        rx->tracker.initialized = false;
+        rx->open = true;
+        listen_deadline = now + CADENCE_LISTEN_MS;
+        LOG_INF("Cadence search: type=%u id=%u window=%u ms", rx->type, cadence_id, CADENCE_LISTEN_MS);
+    }
+}
 static void ant_callback(ant_evt_t *event)
 {
     if (k_msgq_put(&ant_events, event, K_NO_WAIT)) atomic_set(&ant_overflow, 1);
@@ -317,29 +435,51 @@ int main(void)
     hrm.HRM_PROFILE_model_num = 1;
     err = bt_enable(NULL);
     if (err) startup_error("BLE", err);
-    k_work_reschedule(&scan_work, K_NO_WAIT);
+    err = cadence_setup();
+    if (err) startup_error("Cadence RX", err);
+    LOG_INF("Standby: waiting for crank motion; BLE search budget %u seconds", ACTIVITY_SEARCH_MS / 1000);
     int64_t next_status = 0;
     while (true) {
         usb_bootloader_check();
+        bool motion = false;
         ant_evt_t event;
-        if (!k_msgq_get(&ant_events, &event, K_MSEC(50))) {
-            if (event.event == EVENT_CHANNEL_CLOSED) {
-                ant_open = false;
-                ant_closing = false;
-            }
-            /* The profile callback runs after encoding; refresh beforehand too. */
-            profile_event(&hrm, ANT_HRM_PAGE_0_UPDATED);
-            ant_hrm_sens_evt_handler(&event, &hrm);
+        if (!k_msgq_get(&ant_events, &event, K_MSEC(250))) {
+            if (event.channel == 0) {
+                if (event.event == EVENT_CHANNEL_CLOSED) {
+                    ant_open = false;
+                    ant_closing = false;
+                }
+                profile_event(&hrm, ANT_HRM_PAGE_0_UPDATED);
+                ant_hrm_sens_evt_handler(&event, &hrm);
+            } else motion = cadence_event(&event);
         }
         if (atomic_get(&ant_overflow)) { LOG_ERR("ANT event overflow"); k_oops(); }
+        int64_t now = k_uptime_get();
         k_spinlock_key_t key = k_spin_lock(&sample_lock);
-        bool fresh = sample.valid && k_uptime_get() - sample.received < STALE_MS;
+        bool fresh = sample.valid && now - sample.received < STALE_MS;
+        int64_t hr_received = sample.received;
         k_spin_unlock(&sample_lock, key);
-        if (k_uptime_get() >= next_status) {
-            LOG_INF("Status: BLE=%s, scan_reports=%ld, fresh_HR=%u, ANT=%u",
-                    atomic_get(&ble_connected) ? "connected" : "scanning",
-                    (long)atomic_get(&scan_reports), fresh, ant_open);
-            next_status = k_uptime_get() + 5000;
+        enum activity_state before = activity.state;
+        activity_step(&activity, now, motion, fresh, hr_received);
+        if (activity.state != before) {
+            LOG_INF("Activity: %s -> %s", activity_name(before), activity_name(activity.state));
+            if (activity.state == ACTIVITY_SEARCHING) {
+                invalidate();
+                atomic_set(&ble_allowed, 1);
+                k_work_reschedule(&scan_work, K_NO_WAIT);
+            } else if (activity.state == ACTIVITY_STANDBY) {
+                ble_stop();
+            }
+        }
+        fresh = fresh && activity.state == ACTIVITY_FORWARDING;
+        cadence_poll(now, activity.state != ACTIVITY_STANDBY);
+        if (now >= next_status) {
+            LOG_INF("Status: mode=%s BLE=%s scan_reports=%ld fresh_HR=%u ANT=%u cadence_id=%u",
+                    activity_name(activity.state),
+                    atomic_get(&ble_connected) ? "connected" :
+                    atomic_get(&ble_allowed) ? "scanning" : "off",
+                    (long)atomic_get(&scan_reports), fresh, ant_open, cadence_id);
+            next_status = now + (activity.state == ACTIVITY_STANDBY ? 30000 : 5000);
         }
         if (fresh && !ant_open && !ant_closing) {
             profile_event(&hrm, ANT_HRM_PAGE_0_UPDATED);

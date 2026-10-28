@@ -1,5 +1,6 @@
 #include "hr_measurement.h"
 #define CHECK(x) do { if (!(x)) return __LINE__; } while (0)
+int activity_tests(void);
 int run_tests(void)
 {
     struct hr_measurement out;
@@ -40,5 +41,5 @@ int run_tests(void)
     for (unsigned i = 0; i < sizeof(rr); i++) {
         CHECK(hr_parse(rr, i, &out) == (i == 6));
     }
-    return 0;
+    return activity_tests();
 }
