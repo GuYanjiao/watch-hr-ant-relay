@@ -1,0 +1,8 @@
+source "Kconfig.zephyr"
+config WATCH_HR_RELAY
+    bool
+    default y
+    select ANT
+    select ANT_HRM
+    select ANT_KEY_MANAGER
+    select ANT_CHANNEL_CONFIG
